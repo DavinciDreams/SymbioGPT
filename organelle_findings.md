@@ -104,17 +104,62 @@ The gate specialization pattern echoes the endosymbiotic theory that inspired Sy
 - The **layer-dependent specialization** mirrors how different organelles serve different functions at different stages of cellular processing — ribosomes (local) operate before the Golgi apparatus (global routing).
 - The gate didn't eliminate any organelle entirely, suggesting that even "weak" organelles provide complementary signal — much like how real cells retain seemingly redundant pathways because they serve niche functions.
 
-## Ongoing: Distillation A/B Test
+## Distillation A/B Test Results
 
-To validate that teacher gate insights transfer effectively, we are running a controlled experiment:
+To validate whether teacher soft targets improve student training, we ran a controlled experiment with two identical ~4.8M-param students (gate-informed architecture: conv-only layer 0, conv+attention layers 1-5):
 
-- **Student A** (distilled): Trained with KL divergence from teacher soft targets + CE loss
-- **Student B** (from scratch): CE loss only, identical architecture and hyperparameters
+- **Student A** (distilled): `loss = 0.5 * CE + 0.5 * KL(student/T, teacher/T) * T^2`, temperature=2.0
+- **Student B** (from scratch): `loss = CE` only
 
-Both use the gate-informed student architecture above. Results will determine whether teacher guidance accelerates convergence and/or improves final quality before proceeding to evolutionary architecture search.
+Both trained for 5,000 steps on the same data with identical seeds, batch=64, lr=6e-4, BF16 on A100.
 
-See `distill_test.ipynb` for the full experiment.
+**W&B runs**: [distill-test-distilled](https://wandb.ai/lisamegawatts-decentralized-intelligence-agency/symbiogenesis/runs/qgxw2u5j), [distill-test-scratch](https://wandb.ai/lisamegawatts-decentralized-intelligence-agency/symbiogenesis/runs/eqfiw9oj)
+
+### Step-by-Step Comparison
+
+| Step | Distilled PPL | Scratch PPL | Delta | Winner |
+|------|--------------|-------------|-------|--------|
+| 250 | 225.1 | 210.0 | -15.1 | scratch |
+| 500 | 91.0 | 88.8 | -2.2 | scratch |
+| 750 | 70.3 | 69.9 | -0.4 | scratch |
+| 1000 | 62.1 | 62.0 | -0.1 | scratch |
+| 1250 | 57.7 | 58.3 | +0.6 | distill |
+| 1500 | 53.8 | 55.5 | **+1.7** | distill |
+| 1750 | 51.4 | 52.9 | +1.5 | distill |
+| 2000 | 50.8 | 51.4 | +0.5 | distill |
+| 2250 | 49.2 | 50.1 | +0.8 | distill |
+| 2500 | 48.0 | 48.7 | +0.7 | distill |
+| 2750 | 47.6 | 47.6 | +0.0 | tied |
+| 3000 | 47.0 | 46.9 | -0.0 | scratch |
+| 3250 | 46.2 | 46.6 | +0.4 | distill |
+| 3500 | 46.0 | 45.8 | -0.2 | scratch |
+| 3750 | 45.2 | 44.6 | -0.7 | scratch |
+| 4000 | 44.9 | 44.5 | -0.4 | scratch |
+| 4250 | 44.5 | 44.3 | -0.3 | scratch |
+| 4500 | 44.2 | 44.1 | -0.2 | scratch |
+| 4750 | 44.1 | 43.9 | -0.3 | scratch |
+| **5000** | **44.2** | **43.9** | **-0.3** | **scratch** |
+
+### Three-Phase Pattern
+
+| Phase | Steps | Winner | Margin | Interpretation |
+|-------|-------|--------|--------|----------------|
+| Early | 0-1000 | Scratch | -0.1 to -15 | KD loss splits optimization budget, slows initial convergence |
+| Mid | 1250-2750 | Distill | +0.5 to +1.7 | Soft targets help navigate loss landscape |
+| Late | 3000-5000 | Scratch | -0.2 to -0.7 | Both converge; KD overhead becomes drag |
+
+### Verdict: Roughly Tied (delta = -0.3 PPL)
+
+Distillation provides a transient mid-training advantage (peak +1.7 PPL at step 1500) but the benefit washes out by step 3000. Final quality is equivalent, while distilled training is 36% slower (737s vs 541s) due to the teacher forward pass.
+
+### Implications for Evolution Pipeline
+
+1. **Skip KD loss in architecture search** — from-scratch CE training matches distillation quality and is faster
+2. **The teacher's value is architectural, not pedagogical** — gate weight analysis (which organelles to keep, layer-by-layer) is the lasting insight, not soft target guidance
+3. **Architecture search can use cheap from-scratch runs** — no need to keep the teacher in the training loop, simplifying the evolution pipeline
+
+See `distill_test.ipynb` for the full experiment notebook.
 
 ---
 
-*Generated from SymbioGPT-10M training run. Full gate weight data available in W&B project `symbiogenesis`.*
+*Generated from SymbioGPT-10M training run. Full gate weight and distillation data available in W&B project `symbiogenesis`.*
