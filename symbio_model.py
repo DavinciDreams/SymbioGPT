@@ -20,7 +20,6 @@ References:
 """
 import logging
 import math
-import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -28,14 +27,99 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Reuse building blocks from symbiogenesis transformer track
-sys.path.insert(0, "/home/ubuntu/Dev/symbiogenesis")
-from symbiogenesis.transformer_unit import (
-    CausalSelfAttention,
-    RMSNorm,
-    RotaryEmbedding,
-    SwiGLU,
-)
+# ═══════════════════════════════════════════════════════════════════
+# Building blocks (inlined from symbiogenesis for portability)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+class RotaryEmbedding(nn.Module):
+    """Rotary positional embedding (RoPE)."""
+
+    def __init__(self, dim: int, max_seq_len: int = 2048):
+        super().__init__()
+        freqs = 1.0 / (10000.0 ** (torch.arange(0, dim, 2).float() / dim))
+        positions = torch.arange(max_seq_len).float()
+        angles = torch.outer(positions, freqs)
+        self.register_buffer("cos_cache", angles.cos())
+        self.register_buffer("sin_cache", angles.sin())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply rotary embedding to x: (batch, n_heads, seq_len, head_dim)."""
+        seq_len = x.size(2)
+        half = x.size(-1) // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        cos = self.cos_cache[:seq_len, :half].unsqueeze(0).unsqueeze(0)
+        sin = self.sin_cache[:seq_len, :half].unsqueeze(0).unsqueeze(0)
+        o1 = x1 * cos - x2 * sin
+        o2 = x1 * sin + x2 * cos
+        return torch.cat([o1, o2], dim=-1)
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU feed-forward: out = W2(swish(W1·x) * V·x)."""
+
+    def __init__(self, d_model: int, ffn_mult: int = 4):
+        super().__init__()
+        raw_hidden = 2 * d_model * ffn_mult // 3
+        hidden_dim = max(64, (raw_hidden // 64) * 64)
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.v = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.act(self.w1(x)) * self.v(x))
+
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention with RoPE."""
+
+    def __init__(self, d_model: int, n_heads: int, head_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        total_dim = n_heads * head_dim
+        self.wq = nn.Linear(d_model, total_dim, bias=False)
+        self.wk = nn.Linear(d_model, total_dim, bias=False)
+        self.wv = nn.Linear(d_model, total_dim, bias=False)
+        self.wo = nn.Linear(total_dim, d_model, bias=False)
+        self.attn_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RotaryEmbedding,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, T, D = x.shape
+        H, HD = self.n_heads, self.head_dim
+        q = self.wq(x).view(B, T, H, HD).transpose(1, 2)
+        k = self.wk(x).view(B, T, H, HD).transpose(1, 2)
+        v = self.wv(x).view(B, T, H, HD).transpose(1, 2)
+        q = rope(q)
+        k = rope(k)
+        scale = 1.0 / math.sqrt(HD)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if mask is not None:
+            attn = attn + mask
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, H * HD)
+        return self.wo(out)
 
 logger = logging.getLogger(__name__)
 
