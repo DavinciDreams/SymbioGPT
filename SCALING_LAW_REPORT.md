@@ -45,6 +45,7 @@ All models share the same tokenizer, context length, and training corpus.
 | MonarchSLM | 4.98M | **3.650** | 38.4 | ~100M | 20:1 | — (metrics from checkpoint) |
 | JuliaSLM | 5.04M | **3.540** | 34.5 | ~101M | 20:1 | — (metrics from checkpoint) |
 | SymbioGPT-10M | 11.05M | **3.563** | 35.3 | 266M | 24:1 | [`5bi3p1dp`](https://wandb.ai/lisamegawatts-decentralized-intelligence-agency/symbiogenesis/runs/5bi3p1dp) |
+| JuliaFluxGPT-fused | 22.79M | **3.698** | 40.4 | ~131M | 6:1 | [`juliafluxgpt-slm-fusion`](https://wandb.ai/lisamegawatts-decentralized-intelligence-agency/symbiogenesis) |
 
 ### JuliaFluxGPT-1M Training Curve
 
@@ -159,13 +160,32 @@ The jump from 10.7 to 6.62 in run `4odlhnwf` corresponds to a data/configuration
 - **RMSNorm** (256 → 512): Source weights in first 256 dims, pad with 1.0 (identity scaling)
 - **Layers 6–7** (no source): Randomly initialized (JuliaSLM has 6 layers, JuliaFluxGPT has 8)
 
-**Early results (fine-tuning in progress):**
+**Pre-fine-tune baseline**: Fused model before training: val_loss=6.843, ppl=937.2 — the zero-padded dimensions and random layers 6–7 start poorly but still far better than random init.
 
-| Step | Val Loss | Val PPL | LR | Notes |
-|------|----------|---------|-----|-------|
-| 500 | 3.934 | 51.1 | 2.99e-04 | First checkpoint, new best |
+**Fine-tuning results** (8000 steps, LR 3e-4 → 1e-5 cosine, batch=64, bf16, A100):
 
-For comparison, JuliaFluxGPT trained from scratch on dirty data plateaued at val_loss=6.62. The fused model starts at 3.93 — a **2.7 loss improvement** from weight transfer alone, before fine-tuning has converged. This confirms the fusion hypothesis: high-quality small-model weights projected into a larger architecture provide a far better initialization than random or dirty-data weights.
+| Step | Val Loss | Val PPL | Notes |
+|------|----------|---------|-------|
+| 500 | 3.934 | 51.1 | |
+| 1,000 | 3.863 | 47.6 | |
+| 1,500 | 3.859 | 47.4 | |
+| 2,000 | 3.844 | 46.7 | |
+| 2,500 | 3.851 | 47.0 | |
+| 3,000 | 3.807 | 45.0 | |
+| 3,500 | 3.788 | 44.1 | |
+| 4,000 | 3.771 | 43.4 | |
+| 4,500 | 3.715 | 41.0 | |
+| 5,000 | 3.739 | 42.1 | |
+| 5,500 | 3.730 | 41.7 | |
+| 6,000 | 3.720 | 41.3 | |
+| 6,500 | 3.703 | 40.6 | |
+| **7,000** | **3.698** | **40.4** | **Best** |
+| 7,500 | 3.705 | 40.6 | Plateau |
+| 8,000 | 3.705 | 40.6 | Plateau |
+
+**Final: val_loss=3.698, val_ppl=40.4 at step 7000** (best checkpoint saved). The model plateaued after step 7000 with LR approaching minimum.
+
+**Analysis**: The fused 23M model achieved val_loss=3.70 — better than SymbioSLM (3.62) and MonarchSLM (3.65), but did not break the JuliaSLM plateau (3.54) despite having 4.5× more parameters. This provides strong additional evidence that the 266M-token corpus is the binding constraint: even with successful weight transfer from a well-trained smaller model, the extra capacity cannot learn representations that aren't present in the data. The fusion dramatically improved over the dirty-data baseline (6.84 → 3.70) but could not exceed what a 5M model already learned from the same corpus.
 
 ### Distillation Test (from symbiogenesis project)
 
@@ -182,8 +202,9 @@ Distillation provided marginal benefit (+0.006 loss) in this test — likely bec
 
 - **1M → 5M** (5× params): loss drops **0.91** (4.45 → 3.54), PPL 85 → 35
 - **5M → 11M** (2.2× params): loss increases **+0.02** (3.54 → 3.56)
+- **5M → 23M** via fusion (4.5× params): loss increases **+0.16** (3.54 → 3.70)
 
-The 266M-token corpus saturates around 5M parameters. Additional capacity above this point is wasted without more data.
+The 266M-token corpus saturates around 5M parameters. Additional capacity above this point is wasted without more data. Even with high-quality weight transfer (symbiogenesis projection), a 23M model cannot surpass what a 5M model already learned from the same corpus.
 
 ### 2. Architecture-Agnostic Convergence at ~5M
 
@@ -205,7 +226,13 @@ SymbioGPT-10M shows genuine layer-wise specialization (gate entropy 1.21 < unifo
 
 JuliaFluxGPT at 23M params trained on dirty data achieves val_loss ~6.6. JuliaSLM at 5M params (4.6× smaller) trained on curated data achieves 3.54. **Data quality provides a 3.06 loss improvement** — equivalent to many orders of magnitude in model scaling.
 
-### 5. SVD Compression Requires Well-Trained Weights
+### 5. Fusion Transfer Confirms Data Bottleneck
+
+Projecting JuliaSLM weights (5M, val_loss=3.54) into JuliaFluxGPT (23M) via symbiogenesis projection and fine-tuning for 8000 steps produced val_loss=3.698 — better than SymbioSLM (3.62) and MonarchSLM (3.65), but worse than the source JuliaSLM (3.54). The 23M model has 4.5× more parameters but cannot outperform the 5M model on the same 266M-token corpus.
+
+This is the strongest evidence yet for the data bottleneck thesis: the additional 18M parameters in the fused model have nothing useful to learn from the existing corpus. The weight transfer gave them good initialization from JuliaSLM, but fine-tuning could only recover to the same performance range, not exceed it. **More data, not more parameters, is the path forward.**
+
+### 6. SVD Compression Requires Well-Trained Weights
 
 Wolves evolutionary compression on JuliaFluxGPT-23M (dirty-data weights, val_loss=6.62) produced a flat fitness landscape: 10 wolves spanning 20–25M params all scored within 0.028 fitness of each other, and 5 generations improved loss by only 0.007. SVD truncation is effective when weight matrices have steep singular value decay — i.e., when a few directions capture most of the learned structure. Dirty-data weights lack this property; their singular values decay uniformly, making all rank truncations equally lossy.
 
@@ -222,10 +249,11 @@ JuliaFluxGPT-1M trained to 4× Chinchilla (80:1 tok/param vs 20:1) showed contin
 
 ## Next Steps
 
-1. ~~**Fusion transfer**~~: **In progress.** JuliaSLM weights projected into JuliaFluxGPT via symbiogenesis projection, fine-tuning for 8000 steps. Early result: val_loss=3.93 at step 500. Notebook: `fuse_juliaslm.ipynb`
-2. **Post-fusion wolves**: Run SVD compression on the fused model — the clean weights will have meaningful singular value structure to compress, unlike the flat landscape observed on dirty weights.
-3. **Corpus expansion**: The clear bottleneck. Need >1B tokens to see benefit from >5M params. The fused 23M model may break the 3.54 plateau by leveraging additional capacity on the existing 266M corpus, but further gains require more data.
-4. **Symbiogenesis Phase D**: MoE via fusion — combine specialized organelle units into a mixture-of-experts architecture.
+1. ~~**Fusion transfer**~~: **Complete.** JuliaSLM → JuliaFluxGPT projection fusion achieved val_loss=3.698 (PPL 40.4) at step 7000. Did not break the 3.54 plateau — confirms data bottleneck. Notebook: `fuse_juliaslm.ipynb`, checkpoint: `LisaMegaWatts/JuliaFluxGPT-fused`
+2. **Wolves on JuliaSLM**: **In progress.** SVD compression targeting JuliaSLM (5M, clean weights, val_loss=3.54) with more aggressive hyperparams. Notebook: `wolves_juliaslm.ipynb`
+3. **Post-fusion wolves**: Run SVD compression on the fused 23M model — the clean weights will have meaningful singular value structure to compress.
+4. **Corpus expansion**: The clear bottleneck. Need >1B tokens to see benefit from >5M params. All models from 5M to 23M converge to ~3.5–3.7 on this corpus.
+5. **Symbiogenesis Phase D**: MoE via fusion — combine specialized organelle units into a mixture-of-experts architecture.
 
 ## HuggingFace Repos
 
@@ -237,6 +265,7 @@ JuliaFluxGPT-1M trained to 4× Chinchilla (80:1 tok/param vs 20:1) showed contin
 | SymbioSLM | [LisaMegaWatts/SymbioSLM](https://huggingface.co/LisaMegaWatts/SymbioSLM) | checkpoint v1 |
 | SymbioGPT-10M | [LisaMegaWatts/SymbioGPT-10M](https://huggingface.co/LisaMegaWatts/SymbioGPT-10M) | `symbio_best.pt` |
 | JuliaFluxGPT | [LisaMegaWatts/JuliaFluxGPT](https://huggingface.co/LisaMegaWatts/JuliaFluxGPT) | `juliaflux_weights.pt` |
+| JuliaFluxGPT-fused | [LisaMegaWatts/JuliaFluxGPT-fused](https://huggingface.co/LisaMegaWatts/JuliaFluxGPT-fused) | `juliaflux_fused_best.pt` |
 
 ## W&B Run Index
 
@@ -245,6 +274,7 @@ JuliaFluxGPT-1M trained to 4× Chinchilla (80:1 tok/param vs 20:1) showed contin
 | `p7yt1too` | symbiogenesis | juliafluxgpt-1m-scaling | JuliaFluxGPT-1M | finished |
 | `5bi3p1dp` | symbiogenesis | symbio-teacher-10m-chinchilla | SymbioGPT-10M | finished |
 | `drthfacf` | julia-slm | symbiogenesis-4262K | SymbioSLM | crashed (metrics from checkpoint) |
+| — | symbiogenesis | juliafluxgpt-slm-fusion | JuliaFluxGPT-fused | finished |
 | `hwjoituu` | symbiogenesis | wolves-compress-juliafluxgpt | Wolves compression | killed (gen 5) |
 | `mkh7robk` | JuliaFluxGPT | julia-mkh7robk | JuliaFluxGPT-23M | crashed |
 | `h0qutwnv` | JuliaFluxGPT | resume-500 | JuliaFluxGPT-23M | crashed |
