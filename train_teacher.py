@@ -8,7 +8,7 @@ Usage:
 
 Requirements (CLAUDE.md mandated):
     - W&B logging active (WANDB_API_KEY set)
-    - HF repo exists (LisaMegaWatts/SymbioTeacher-10M)
+    - HF repo exists (LisaMegaWatts/SymbioGPT-10M)
     - Checkpoint directory set
 """
 import argparse
@@ -42,7 +42,7 @@ VAL_PATH = os.path.join(DATA_DIR, "val.txt")
 VOCAB_PATH = os.path.join(DATA_DIR, "vocab.json")
 MERGES_PATH = os.path.join(DATA_DIR, "merges.txt")
 CHECKPOINT_DIR = "/home/ubuntu/Dev/juliaGPT/SymbioSLM/checkpoints/teacher"
-HF_REPO = "LisaMegaWatts/SymbioTeacher-10M"
+HF_REPO = "LisaMegaWatts/SymbioGPT-10M"
 
 # ── 10M Teacher Config ──
 TEACHER_CONFIG = SymbioConfig(
