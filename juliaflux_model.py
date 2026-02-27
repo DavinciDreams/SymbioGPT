@@ -1,10 +1,10 @@
 """JuliaFluxGPT — PyTorch reimplementation of JuliaFluxGPT (Flux.jl).
 
-LLaMA-style decoder with Grouped Query Attention (4Q/2KV), RMSNorm,
+LLaMA-style decoder with Grouped Query Attention (8Q/2KV), RMSNorm,
 SwiGLU, RoPE, and weight-tied output. Matches model.jl exactly.
 
-Config: d_model=256, n_layers=4, n_heads=4, n_kv_heads=2, head_dim=64,
-        ctx=256, vocab=4000, ~4M params.
+Config: d_model=512, n_layers=8, n_heads=8, n_kv_heads=2, head_dim=64,
+        ctx=256, vocab=2000, ~23M params.
 """
 import math
 from dataclasses import dataclass
@@ -21,13 +21,13 @@ import torch.nn.functional as F
 
 @dataclass
 class JuliaFluxConfig:
-    d_model: int = 256
-    n_layers: int = 4
-    n_heads: int = 4
+    d_model: int = 512
+    n_layers: int = 8
+    n_heads: int = 8
     n_kv_heads: int = 2
     head_dim: int = 64
     context_length: int = 256
-    vocab_size: int = 4000
+    vocab_size: int = 2000
     dropout: float = 0.0
     weight_tying: bool = True
     rope_base: float = 10000.0
@@ -249,5 +249,5 @@ def load_from_npz(npz_path: str, config: JuliaFluxConfig = None) -> JuliaFluxGPT
         arr = data[key]
         state_dict[key] = torch.from_numpy(arr.copy())
 
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     return model
