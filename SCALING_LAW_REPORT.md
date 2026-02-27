@@ -109,12 +109,36 @@ The jump from 10.7 to 6.62 in run `4odlhnwf` corresponds to a data/configuration
 
 | W&B Run | Status | Notes |
 |---------|--------|-------|
-| [`hwjoituu`](https://wandb.ai/lisamegawatts-decentralized-intelligence-agency/symbiogenesis/runs/hwjoituu) | Running (stalled) | SVD compression of JuliaFluxGPT-23M |
+| [`hwjoituu`](https://wandb.ai/lisamegawatts-decentralized-intelligence-agency/symbiogenesis/runs/hwjoituu) | Killed (gen 5) | SVD compression of JuliaFluxGPT-23M |
 
 - Population of 10 wolves, SVD rank schedules [77–512]
-- Best after 5 generations: val_loss=7.31, 19.5M params (14.3% compression)
-- Fitness landscape essentially flat — all wolves within 0.03 of each other
-- **Conclusion**: Compressing dirty-data weights is not productive; the weights lack meaningful structure to preserve
+- ~13 min/generation on A100, killed after gen 5
+
+**Initial population (gen 0):**
+
+| Wolf | Params | Val Loss | Entropy | Fitness | Rank Range |
+|------|--------|----------|---------|---------|------------|
+| 0 | 23.1M | 7.342 | 1.449 | -7.356 | 89–500 |
+| 1 | 22.1M | 7.335 | 1.479 | -7.349 | 92–504 |
+| 2 | 23.4M | 7.332 | 1.439 | -7.347 | 77–506 |
+| 3 | 24.7M | 7.345 | 1.402 | -7.359 | 78–509 |
+| 4 | 20.5M | 7.327 | 1.519 | -7.342 | 88–510 |
+| **5** | **20.6M** | **7.316** | **1.522** | **-7.331** | **79–464** |
+| 6 | 20.1M | 7.326 | 1.539 | -7.341 | 90–496 |
+| 7 | 22.0M | 7.335 | 1.480 | -7.350 | 80–503 |
+| 8 | 21.4M | 7.327 | 1.496 | -7.342 | 112–497 |
+| 9 | 22.5M | 7.334 | 1.463 | -7.349 | 82–512 |
+
+**Evolution summary:**
+
+| Gen | Best Loss | Best PPL | Best Params | Compression | Replacements |
+|-----|-----------|----------|-------------|-------------|-------------|
+| 0 | 7.316 | 1503.3 | 20.6M | 9.5% smaller | 2 |
+| 5 | 7.309 | 1493.0 | 19.5M | 14.3% smaller | 3 |
+
+- Fitness spread at init: only **0.028** (worst -7.359 vs best -7.331) — essentially flat
+- After 5 generations: loss improved by only **0.007** (7.316 → 7.309)
+- **Conclusion**: Compressing dirty-data weights is not productive; the weights lack meaningful structure to preserve. The fitness landscape is flat because all SVD truncations lose roughly equal amounts of noise.
 
 ### Distillation Test (from symbiogenesis project)
 
@@ -186,7 +210,7 @@ JuliaFluxGPT-1M trained to 4× Chinchilla (80:1 tok/param vs 20:1) showed contin
 | `p7yt1too` | symbiogenesis | juliafluxgpt-1m-scaling | JuliaFluxGPT-1M | finished |
 | `5bi3p1dp` | symbiogenesis | symbio-teacher-10m-chinchilla | SymbioGPT-10M | finished |
 | `drthfacf` | julia-slm | symbiogenesis-4262K | SymbioSLM | crashed (metrics from checkpoint) |
-| `hwjoituu` | symbiogenesis | wolves-compress-juliafluxgpt | Wolves compression | running |
+| `hwjoituu` | symbiogenesis | wolves-compress-juliafluxgpt | Wolves compression | killed (gen 5) |
 | `mkh7robk` | JuliaFluxGPT | julia-mkh7robk | JuliaFluxGPT-23M | crashed |
 | `h0qutwnv` | JuliaFluxGPT | resume-500 | JuliaFluxGPT-23M | crashed |
 | `rzhelyrs` | JuliaFluxGPT | resume-2500 | JuliaFluxGPT-23M | crashed |
