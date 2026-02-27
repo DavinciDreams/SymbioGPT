@@ -1,0 +1,29 @@
+# Data files (large, cached via curate_data.py)
+data/
+*.tokens.pt
+
+# Checkpoints (stored on HuggingFace)
+checkpoints/
+
+# W&B
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
