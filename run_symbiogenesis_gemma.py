@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Symbiogenesis LoRA Evolution on Gemma-3-270M (local run).
 
-Converted from symbiogenesis_gemma.ipynb for local execution.
-RTX 3060 12GB is sufficient — model is ~540MB in fp16.
+Optimized for RTX 3060 12GB:
+- No deepcopy: uses PEFT adapter add/delete on single base model
+- Batch size 2 + grad accum 4 (effective batch 8)
+- 262k vocab = huge logits, so small batches are critical
 """
 
-import os, math, time, random, copy, json
+import os, math, time, random, json, gc
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
+from collections import Counter
 
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download, HfApi, create_repo
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 import wandb
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -28,15 +31,19 @@ CHILDREN_PER_GEN = 2
 TOURNAMENT_K = 3
 TRAIN_STEPS_PER_UNIT = 300
 UNIT_LR = 2e-4
-UNIT_BATCH = 8
-BETA = 0.01  # free energy complexity penalty
+UNIT_BATCH = 2        # small for 12GB GPU (262k vocab = huge logits)
+GRAD_ACCUM = 4        # effective batch = 8
+BETA = 0.01
 GELATION_PATIENCE = 10
 
 EXTENDED_STEPS = 2000
 EXTENDED_LR = 2e-4
-EXTENDED_BATCH = 8
+EXTENDED_BATCH = 2
+EXTENDED_GRAD_ACCUM = 4
 EXTENDED_WARMUP = 100
 EVAL_EVERY = 250
+
+EVAL_BATCH = 4        # eval doesn't need gradients, can be a bit larger
 
 # ── GPU + dtype ─────────────────────────────────────────────────────────────
 print(f"PyTorch: {torch.__version__}")
@@ -48,7 +55,6 @@ if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
     mem = getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)
     print(f"GPU: {gpu_name} ({mem / 1e9:.1f} GB)")
-    # bf16 for Ampere+, fp16 for older
     DTYPE = torch.bfloat16 if any(x in gpu_name.lower() for x in ['a100', 'h100', 'a10', 'l4', 'l40', '3060', '3070', '3080', '3090', '4060', '4070', '4080', '4090']) else torch.float16
 else:
     DTYPE = torch.float32
@@ -99,13 +105,12 @@ print(f'Train: {len(train_inputs):,} seqs ({len(train_inputs)*CTX:,} tokens)')
 print(f'Val: {len(val_inputs):,} seqs')
 del train_text, val_text, train_ids, val_ids
 
-# ── Load frozen base model ──────────────────────────────────────────────────
+# ── Load frozen base model (single copy, on CUDA) ──────────────────────────
 print(f'\nLoading {MODEL_NAME} (frozen base, dtype={DTYPE})...')
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=DTYPE,
-    device_map='auto',
-)
+).to(device)
 base_model.eval()
 for p in base_model.parameters():
     p.requires_grad = False
@@ -113,6 +118,8 @@ for p in base_model.parameters():
 n_base_params = sum(p.numel() for p in base_model.parameters())
 print(f'Base model: {n_base_params:,} params ({n_base_params/1e6:.0f}M)')
 print(f'Device: {next(base_model.parameters()).device}')
+print(f'GPU mem after load: {torch.cuda.memory_allocated()/1e9:.2f} GB / '
+      f'{torch.cuda.max_memory_allocated()/1e9:.2f} GB peak')
 
 linear_names = set()
 for name, module in base_model.named_modules():
@@ -125,18 +132,20 @@ print('\nBaseline eval (no adapter)...')
 total_loss = 0.0
 total_tokens = 0
 with torch.no_grad():
-    for i in range(0, min(len(val_inputs), 64), 8):
-        batch_in = val_inputs[i:i+8].to(device)
-        batch_tgt = val_labels[i:i+8].to(device)
+    for i in range(0, min(len(val_inputs), 64), EVAL_BATCH):
+        batch_in = val_inputs[i:i+EVAL_BATCH].to(device)
+        batch_tgt = val_labels[i:i+EVAL_BATCH].to(device)
         out = base_model(batch_in)
         logits = out.logits.float()
         B, T, V = logits.shape
         loss = F.cross_entropy(logits.reshape(B*T, V), batch_tgt.reshape(B*T), reduction='sum')
         total_loss += loss.item()
         total_tokens += B * T
+        del out, logits, loss
 base_loss = total_loss / total_tokens
 base_ppl = math.exp(min(base_loss, 20.0))
 print(f'Baseline: val_loss={base_loss:.4f} ppl={base_ppl:.1f}')
+print(f'GPU mem after baseline: {torch.cuda.memory_allocated()/1e9:.2f} GB')
 
 # ── LoRA unit ───────────────────────────────────────────────────────────────
 ATTN_TARGETS = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
@@ -259,8 +268,8 @@ def tournament_select(population: List[LoRAUnit], k=3) -> LoRAUnit:
     return max(contestants, key=lambda u: u.fitness)
 
 
-# ── Train + eval ────────────────────────────────────────────────────────────
-def evaluate_lm(model, val_inputs, val_labels, batch_size=8, max_batches=32):
+# ── Train + eval (no deepcopy — adapter add/delete) ────────────────────────
+def evaluate_lm(model, val_inputs, val_labels, batch_size=EVAL_BATCH, max_batches=32):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -275,16 +284,36 @@ def evaluate_lm(model, val_inputs, val_labels, batch_size=8, max_batches=32):
             loss = F.cross_entropy(logits.reshape(B*T, V), batch_tgt.reshape(B*T), reduction='sum')
             total_loss += loss.item()
             total_tokens += B * T
+            del out, logits, loss
     return total_loss / max(total_tokens, 1), math.exp(min(total_loss / max(total_tokens, 1), 20.0))
+
+
+# Global adapter counter to ensure unique names
+_adapter_counter = 0
 
 
 def train_and_eval_unit(unit, base_model, train_inputs, train_labels,
                         val_inputs, val_labels, n_steps=300, lr=2e-4,
-                        batch_size=8, warmup=50):
-    lora_config = make_lora_config(unit)
-    model = get_peft_model(copy.deepcopy(base_model), lora_config)
-    model.train()
+                        batch_size=UNIT_BATCH, grad_accum=GRAD_ACCUM, warmup=50):
+    """Train a LoRA unit without copying the base model.
 
+    Uses PEFT adapter naming: adds adapter, trains, evals, deletes adapter.
+    """
+    global _adapter_counter
+    adapter_name = f'unit_{_adapter_counter}'
+    _adapter_counter += 1
+
+    lora_config = make_lora_config(unit)
+
+    # Wrap base model with PEFT (first time) or add adapter
+    if not hasattr(base_model, 'peft_config'):
+        model = get_peft_model(base_model, lora_config, adapter_name=adapter_name)
+    else:
+        model = base_model
+        model.add_adapter(adapter_name, lora_config)
+        model.set_adapter(adapter_name)
+
+    model.train()
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     unit.n_trainable = sum(p.numel() for p in trainable_params)
 
@@ -300,6 +329,7 @@ def train_and_eval_unit(unit, base_model, train_inputs, train_labels,
 
     n_train = len(train_inputs)
     step = 0
+    accum_step = 0
     while step < n_steps:
         perm = torch.randperm(n_train)
         for i in range(0, n_train, batch_size):
@@ -316,21 +346,31 @@ def train_and_eval_unit(unit, base_model, train_inputs, train_labels,
                 logits = out.logits
                 B, T, V = logits.shape
                 loss = F.cross_entropy(logits.reshape(B*T, V), batch_tgt.reshape(B*T))
+                loss = loss / grad_accum  # scale for accumulation
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-            step += 1
+            del out, logits, loss
+            accum_step += 1
 
+            if accum_step % grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                step += 1
+
+    # Evaluate
     val_loss, val_ppl = evaluate_lm(model, val_inputs, val_labels)
     unit.val_loss = val_loss
     unit.fitness = -(val_loss + BETA * math.log(max(unit.n_trainable, 1)))
 
-    del model, optimizer, scheduler, trainable_params
+    # Cleanup: delete adapter, free optimizer
+    del optimizer, scheduler, trainable_params
+    model.delete_adapter(adapter_name)
+    gc.collect()
     torch.cuda.empty_cache()
-    return unit
+
+    return unit, model  # return model so we can reuse the PeftModel wrapper
 
 
 # ── CUSUM gelation ──────────────────────────────────────────────────────────
@@ -378,7 +418,7 @@ if __name__ == '__main__':
 
     run = wandb.init(
         project='symbiogenesis',
-        name='symbiogenesis-gemma-270m-lora',
+        name='symbiogenesis-gemma-270m-lora-rtx3060',
         config={
             'method': 'symbiogenesis_lora_evolution',
             'base_model': MODEL_NAME,
@@ -394,12 +434,15 @@ if __name__ == '__main__':
             'train_steps_per_unit': TRAIN_STEPS_PER_UNIT,
             'unit_lr': UNIT_LR,
             'unit_batch': UNIT_BATCH,
+            'grad_accum': GRAD_ACCUM,
+            'effective_batch': UNIT_BATCH * GRAD_ACCUM,
             'beta': BETA,
             'fusion_strategy': 'hybrid',
             'rank_pool': RANK_POOL,
             'max_rank': MAX_RANK,
+            'gpu': gpu_name if torch.cuda.is_available() else 'cpu',
         },
-        tags=['symbiogenesis', 'lora', 'gemma-270m', 'causal-lm', 'philosophy'],
+        tags=['symbiogenesis', 'lora', 'gemma-270m', 'causal-lm', 'philosophy', 'rtx3060'],
         reinit='finish_previous',
     )
 
@@ -407,17 +450,19 @@ if __name__ == '__main__':
     print(f'\nInitializing population of {POP_SIZE} units...')
     population = []
     t_start = time.time()
+    peft_model = base_model  # will become PeftModel after first unit
 
     for i in range(POP_SIZE):
         unit = random_unit(gen=0)
-        unit = train_and_eval_unit(
-            unit, base_model, train_inputs, train_labels,
+        unit, peft_model = train_and_eval_unit(
+            unit, peft_model, train_inputs, train_labels,
             val_inputs, val_labels,
-            n_steps=TRAIN_STEPS_PER_UNIT, lr=UNIT_LR, batch_size=UNIT_BATCH,
+            n_steps=TRAIN_STEPS_PER_UNIT, lr=UNIT_LR,
         )
         population.append(unit)
         elapsed = time.time() - t_start
-        print(f'  Unit {i}: {unit.summary()} ({elapsed:.0f}s)')
+        mem = torch.cuda.memory_allocated() / 1e9
+        print(f'  Unit {i}: {unit.summary()} ({elapsed:.0f}s, {mem:.1f}GB)')
 
     population.sort(key=lambda u: u.fitness, reverse=True)
     print(f'\nBest initial: {population[0].summary()}')
@@ -445,10 +490,10 @@ if __name__ == '__main__':
                 continue
 
             child = mutate(child, mutation_rate=0.3)
-            child = train_and_eval_unit(
-                child, base_model, train_inputs, train_labels,
+            child, peft_model = train_and_eval_unit(
+                child, peft_model, train_inputs, train_labels,
                 val_inputs, val_labels,
-                n_steps=TRAIN_STEPS_PER_UNIT, lr=UNIT_LR, batch_size=UNIT_BATCH,
+                n_steps=TRAIN_STEPS_PER_UNIT, lr=UNIT_LR,
             )
 
             tournament_idx = random.sample(range(len(population)),
@@ -491,10 +536,11 @@ if __name__ == '__main__':
             ppl = math.exp(min(best.val_loss, 20.0))
             gel_str = f' ** GELATION at gen {monitor.gelation_step} **' if monitor.gelation_detected else ''
             elapsed = time.time() - t_start
+            mem = torch.cuda.memory_allocated() / 1e9
             print(f'Gen {gen:3d} | best: loss={best.val_loss:.4f} ppl={ppl:.1f} '
                   f'r={best.rank} d={best.depth} | '
                   f'div={diversity:.2f} repl={replacements} | '
-                  f'{gen_time:.0f}s (total {elapsed:.0f}s){gel_str}')
+                  f'{gen_time:.0f}s (total {elapsed:.0f}s) {mem:.1f}GB{gel_str}')
 
         if (monitor.gelation_detected and
             monitor.gelation_step is not None and
@@ -507,6 +553,8 @@ if __name__ == '__main__':
     print(f'Best unit: {population[0].summary()}')
     if monitor.gelation_detected:
         print(f'Gelation detected at generation {monitor.gelation_step}')
+
+    wandb.finish()
 
     # ── Results ─────────────────────────────────────────────────────────────
     best = population[0]
@@ -539,7 +587,6 @@ if __name__ == '__main__':
         print(f'{i:<5} {u.rank:>5} {u.depth:>6} {targets:<40} '
               f'{u.val_loss:>8.4f} {ppl:>8.1f} {u.n_trainable:>10,}')
 
-    from collections import Counter
     rank_dist = Counter(u.rank for u in population)
     print(f'\nRank distribution: {dict(sorted(rank_dist.items()))}')
     target_counts = Counter()
@@ -554,21 +601,30 @@ if __name__ == '__main__':
     print(f'\nArchitecture diversity: {unique}/{len(population)} unique configs')
 
     # ── Extended fine-tune ──────────────────────────────────────────────────
+    # Need a clean model for extended training
+    # Unwrap back to base model
+    if hasattr(peft_model, 'base_model'):
+        # Get the unwrapped base model
+        unwrapped = peft_model.get_base_model()
+    else:
+        unwrapped = peft_model
+
     print(f'\n{"=" * 70}')
     print(f'Extended fine-tuning: r={best.rank}, targets={list(best.target_modules)}')
     print(f'Steps: {EXTENDED_STEPS}, LR: {EXTENDED_LR}')
 
     best_lora = make_lora_config(best)
-    best_model = get_peft_model(copy.deepcopy(base_model), best_lora)
-    best_model.train()
+    # Create fresh PeftModel for extended training
+    ext_model = get_peft_model(unwrapped, best_lora, adapter_name='best_ext')
+    ext_model.train()
 
-    trainable_params = [p for p in best_model.parameters() if p.requires_grad]
+    trainable_params = [p for p in ext_model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable_params)
     print(f'Trainable params: {n_trainable:,}')
 
     ext_run = wandb.init(
         project='symbiogenesis',
-        name=f'symbiogenesis-gemma-270m-best-r{best.rank}',
+        name=f'symbiogenesis-gemma-270m-best-r{best.rank}-rtx3060',
         config={
             'method': 'extended_finetune',
             'base_model': MODEL_NAME,
@@ -580,6 +636,8 @@ if __name__ == '__main__':
             'gelation_step': monitor.gelation_step,
             'n_steps': EXTENDED_STEPS,
             'lr': EXTENDED_LR,
+            'batch_size': EXTENDED_BATCH,
+            'grad_accum': EXTENDED_GRAD_ACCUM,
         },
         tags=['symbiogenesis', 'lora', 'gemma-270m', 'extended-finetune', 'philosophy'],
         reinit='finish_previous',
@@ -598,6 +656,7 @@ if __name__ == '__main__':
     n_train = len(train_inputs)
     best_ext_loss = float('inf')
     step = 0
+    accum_step = 0
     t_start = time.time()
 
     while step < EXTENDED_STEPS:
@@ -612,39 +671,43 @@ if __name__ == '__main__':
             batch_tgt = train_labels[idx].to(device)
 
             with torch.amp.autocast('cuda', dtype=DTYPE):
-                out = best_model(batch_in)
+                out = ext_model(batch_in)
                 logits = out.logits
                 B, T, V = logits.shape
                 loss = F.cross_entropy(logits.reshape(B*T, V), batch_tgt.reshape(B*T))
+                loss = loss / EXTENDED_GRAD_ACCUM
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
+            del out, logits, loss
+            accum_step += 1
 
-            if step % 50 == 0:
-                wandb.log({'train/loss': loss.item(),
-                           'train/lr': scheduler.get_last_lr()[0]}, step=step)
+            if accum_step % EXTENDED_GRAD_ACCUM == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
 
-            if step > 0 and step % EVAL_EVERY == 0:
-                val_loss, val_ppl = evaluate_lm(best_model, val_inputs, val_labels)
-                wandb.log({'val/loss': val_loss, 'val/ppl': val_ppl}, step=step)
-                marker = ' ** BEST **' if val_loss < best_ext_loss else ''
-                if val_loss < best_ext_loss:
-                    best_ext_loss = val_loss
-                    best_model.save_pretrained('best_lora_adapter')
-                elapsed = time.time() - t_start
-                print(f'  [step {step:5d}] val={val_loss:.4f} ppl={val_ppl:.1f} '
-                      f'lr={scheduler.get_last_lr()[0]:.2e} ({elapsed:.0f}s){marker}')
-                best_model.train()
+                if step % 50 == 0:
+                    wandb.log({'train/lr': scheduler.get_last_lr()[0]}, step=step)
 
-            step += 1
+                if step > 0 and step % EVAL_EVERY == 0:
+                    val_loss, val_ppl = evaluate_lm(ext_model, val_inputs, val_labels)
+                    wandb.log({'val/loss': val_loss, 'val/ppl': val_ppl}, step=step)
+                    marker = ' ** BEST **' if val_loss < best_ext_loss else ''
+                    if val_loss < best_ext_loss:
+                        best_ext_loss = val_loss
+                        ext_model.save_pretrained('best_lora_adapter')
+                    elapsed = time.time() - t_start
+                    print(f'  [step {step:5d}] val={val_loss:.4f} ppl={val_ppl:.1f} '
+                          f'lr={scheduler.get_last_lr()[0]:.2e} ({elapsed:.0f}s){marker}')
+                    ext_model.train()
 
-    final_loss, final_ppl = evaluate_lm(best_model, val_inputs, val_labels)
+                step += 1
+
+    final_loss, final_ppl = evaluate_lm(ext_model, val_inputs, val_labels)
     if final_loss < best_ext_loss:
         best_ext_loss = final_loss
-        best_model.save_pretrained('best_lora_adapter')
+        ext_model.save_pretrained('best_lora_adapter')
 
     elapsed = time.time() - t_start
     wandb.log({'val/final_loss': best_ext_loss,
