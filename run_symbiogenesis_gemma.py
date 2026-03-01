@@ -602,10 +602,11 @@ if __name__ == '__main__':
 
     # ── Extended fine-tune ──────────────────────────────────────────────────
     # Need a clean model for extended training
-    # Unwrap back to base model
-    if hasattr(peft_model, 'base_model'):
-        # Get the unwrapped base model
-        unwrapped = peft_model.get_base_model()
+    # Unwrap back to base model — after all adapters deleted, access .base_model.model directly
+    if hasattr(peft_model, 'base_model') and hasattr(peft_model.base_model, 'model'):
+        unwrapped = peft_model.base_model.model
+    elif hasattr(peft_model, 'base_model'):
+        unwrapped = peft_model.base_model
     else:
         unwrapped = peft_model
 
